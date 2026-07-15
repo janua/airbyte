@@ -96,6 +96,11 @@ class SnowflakeSourceConfigurationFactory :
         // Disable Apache Arrow for now as it is causing issue in jdbc
         jdbcProperties["enableArrow"] = "false"
 
+        // Keep the session alive during long-running reads; sessions otherwise expire
+        // ~4h into a sync. Restores the fix from airbytehq/airbyte#9567 which was
+        // dropped in the 1.0.0 rewrite. Can be overridden via jdbc_url_params.
+        jdbcProperties["CLIENT_SESSION_KEEP_ALIVE"] = "true"
+
         pojo.schema?.let { jdbcProperties["schema"] = it }
         pojo.role.let { jdbcProperties["role"] = it }
 
@@ -114,6 +119,9 @@ class SnowflakeSourceConfigurationFactory :
                 jdbcProperties[key] = URLDecoder.decode(urlEncodedValue, StandardCharsets.UTF_8)
             }
         }
+
+        // Log property keys only (values may contain credentials).
+        log.info { "Resolved Snowflake JDBC property keys: ${jdbcProperties.keys.sorted()}" }
 
         // Load Snowflake JDBC driver
         Class.forName("net.snowflake.client.jdbc.SnowflakeDriver")
