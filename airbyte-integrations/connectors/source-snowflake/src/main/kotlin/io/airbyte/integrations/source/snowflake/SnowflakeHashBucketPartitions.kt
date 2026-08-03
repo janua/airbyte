@@ -72,11 +72,14 @@ import java.util.concurrent.atomic.AtomicReference
  *    query is bounded, so the read can actually complete.
  */
 
-private const val HASH_EXPRESSION = "MOD(ABS(HASH(*)), %d) = %d"
-
-/** Appends the hash-bucket predicate to a generated query, WHERE-aware. */
+/** Appends the hash-bucket predicate to a generated query, WHERE-aware.
+ *
+ * Hashes the explicit column list: `HASH(*)` is only allowed in a SELECT clause in Snowflake,
+ * whereas `HASH(col, ...)` is an ordinary scalar call, legal in WHERE. */
 internal fun hashBucketQuery(q: SelectQuery, bucketIndex: Int, bucketCount: Int): SelectQuery {
-    val predicate: String = HASH_EXPRESSION.format(bucketCount, bucketIndex)
+    require(q.columns.isNotEmpty()) { "cannot hash-bucket a query with no columns" }
+    val hashArgs: String = q.columns.joinToString(", ") { "\"${it.id}\"" }
+    val predicate: String = "MOD(ABS(HASH($hashArgs)), $bucketCount) = $bucketIndex"
     val sql: String =
         if (q.sql.contains(" WHERE ")) "${q.sql} AND $predicate" else "${q.sql} WHERE $predicate"
     return SelectQuery(sql, q.columns, q.bindings)
