@@ -242,9 +242,10 @@ class SnowflakeHashBucketPartitionsCreator(
         val p: DefaultJdbcPartition = partition
         return when (p) {
             is DefaultJdbcCursorIncrementalPartition -> runCursorIncremental(p)
-            is DefaultJdbcUnsplittableSnapshotPartition,
-            is DefaultJdbcUnsplittableSnapshotWithCursorPartition -> runUnsplittableSnapshot(p)
-            else -> delegate.run()
+            // All snapshot shapes, splittable or not: stock splitting can silently produce
+            // zero boundaries and fall back to one unbounded query, so take control of all
+            // large snapshots here.
+            else -> runSnapshot(p)
         }
     }
 
@@ -288,8 +289,8 @@ class SnowflakeHashBucketPartitionsCreator(
         }
     }
 
-    /** Large PK-less snapshots are read as one reader running bounded queries sequentially. */
-    private suspend fun runUnsplittableSnapshot(p: DefaultJdbcPartition): List<PartitionReader> {
+    /** Large snapshots of any shape are read as one reader running bounded queries sequentially. */
+    private suspend fun runSnapshot(p: DefaultJdbcPartition): List<PartitionReader> {
         if (p is JdbcCursorPartition<*>) {
             ensureCursorUpperBound()
             if (
@@ -310,7 +311,7 @@ class SnowflakeHashBucketPartitionsCreator(
             return listOf(CheckpointOnlyPartitionReader())
         }
         val expectedByteSize: Long = estimateAndSetFetchSize(sample)
-        if (expectedByteSize <= SNAPSHOT_SINGLE_QUERY_MAX_BYTES) {
+        if (expectedByteSize <= SAFE_QUERY_BYTES) {
             return delegate.run()
         }
         val bucketCount: Int = bucketCountFor(expectedByteSize)
@@ -333,22 +334,23 @@ class SnowflakeHashBucketPartitionsCreator(
         return expectedByteSize
     }
 
-    private fun bucketCountFor(expectedByteSize: Long): Int {
-        val targetByteSize: Long = sharedState.targetPartitionByteSize
-        return ((expectedByteSize + targetByteSize - 1) / targetByteSize)
+    private fun bucketCountFor(expectedByteSize: Long): Int =
+        ((expectedByteSize + SAFE_QUERY_BYTES - 1) / SAFE_QUERY_BYTES)
             .coerceIn(2L, MAX_BUCKET_COUNT.toLong())
             .toInt()
-    }
 
     companion object {
-        const val MAX_BUCKET_COUNT = 16
+        const val MAX_BUCKET_COUNT = 512
 
         /**
-         * Snapshots below this size keep stock single-query behavior. Sized well below the
-         * observed ~6h credential-lifetime cliff at typical pipeline throughput, and well above
-         * the vast majority of tables so cold-start behavior rarely changes.
+         * Maximum estimated bytes for a single query's result set. Snowflake's staged result
+         * chunks carry credentials with a finite lifetime (~6h observed) which the JDBC driver
+         * never refreshes; a result set must be fully consumed within that lifetime, and the
+         * consumption rate is dictated by the slowest stage of the pipeline (often the
+         * destination). 512 MiB stays inside the lifetime for consumption rates down to
+         * ~25 KB/s, observed as realistic for batched destinations.
          */
-        const val SNAPSHOT_SINGLE_QUERY_MAX_BYTES: Long = 8L shl 30 // 8 GiB
+        const val SAFE_QUERY_BYTES: Long = 512L shl 20 // 512 MiB
     }
 }
 
