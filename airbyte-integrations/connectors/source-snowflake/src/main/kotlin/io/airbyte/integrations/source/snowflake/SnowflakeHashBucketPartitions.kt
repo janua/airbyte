@@ -4,31 +4,27 @@
 
 package io.airbyte.integrations.source.snowflake
 
-import io.airbyte.cdk.command.OpaqueStateValue
 import com.fasterxml.jackson.databind.JsonNode
+import io.airbyte.cdk.command.OpaqueStateValue
 import io.airbyte.cdk.discover.DataField
 import io.airbyte.cdk.discover.EmittedField
 import io.airbyte.cdk.discover.FieldType
 import io.airbyte.cdk.jdbc.IntFieldType
-import io.airbyte.cdk.read.DefaultJdbcCursorIncrementalPartition
-import io.airbyte.cdk.read.DefaultUnsplittableJdbcCursorIncrementalPartition
-import io.airbyte.cdk.read.DefaultJdbcPartition
-import io.airbyte.cdk.read.DefaultJdbcSplittablePartition
-import io.airbyte.cdk.read.DefaultJdbcUnsplittablePartition
-import io.airbyte.cdk.read.DefaultJdbcSharedState
-import io.airbyte.cdk.read.DefaultJdbcStreamState
-import io.airbyte.cdk.read.DefaultJdbcStreamStateValue
-import io.airbyte.cdk.read.DefaultJdbcUnsplittableSnapshotPartition
-import io.airbyte.cdk.read.DefaultJdbcUnsplittableSnapshotWithCursorPartition
 import io.airbyte.cdk.output.DataChannelMedium
 import io.airbyte.cdk.output.OutputMessageRouter
 import io.airbyte.cdk.output.sockets.FieldValueEncoder
 import io.airbyte.cdk.output.sockets.toJson
+import io.airbyte.cdk.read.And
+import io.airbyte.cdk.read.DefaultJdbcCursorIncrementalPartition
+import io.airbyte.cdk.read.DefaultJdbcPartition
+import io.airbyte.cdk.read.DefaultJdbcSharedState
+import io.airbyte.cdk.read.DefaultJdbcSplittablePartition
+import io.airbyte.cdk.read.DefaultJdbcStreamState
+import io.airbyte.cdk.read.DefaultJdbcStreamStateValue
+import io.airbyte.cdk.read.DefaultJdbcUnsplittablePartition
+import io.airbyte.cdk.read.DefaultUnsplittableJdbcCursorIncrementalPartition
+import io.airbyte.cdk.read.Equal
 import io.airbyte.cdk.read.FieldValueChange
-import io.airbyte.cdk.read.JdbcSharedState
-import io.airbyte.cdk.read.JdbcStreamState
-import io.airbyte.cdk.read.ResourceType
-import io.airbyte.cdk.read.Stream
 import io.airbyte.cdk.read.JdbcConcurrentPartitionsCreator
 import io.airbyte.cdk.read.JdbcCursorPartition
 import io.airbyte.cdk.read.JdbcNonResumablePartitionReader
@@ -37,22 +33,24 @@ import io.airbyte.cdk.read.JdbcPartitionFactory
 import io.airbyte.cdk.read.JdbcPartitionReader
 import io.airbyte.cdk.read.JdbcPartitionsCreator
 import io.airbyte.cdk.read.JdbcPartitionsCreatorFactory
+import io.airbyte.cdk.read.JdbcSharedState
+import io.airbyte.cdk.read.JdbcStreamState
 import io.airbyte.cdk.read.MODE_PROPERTY
-import io.airbyte.cdk.read.And
-import io.airbyte.cdk.read.Equal
 import io.airbyte.cdk.read.NoWhere
+import io.airbyte.cdk.read.PartitionReadCheckpoint
+import io.airbyte.cdk.read.PartitionReader
+import io.airbyte.cdk.read.ResourceType
+import io.airbyte.cdk.read.Sample
 import io.airbyte.cdk.read.SelectColumns
+import io.airbyte.cdk.read.SelectQuerier
+import io.airbyte.cdk.read.SelectQuery
 import io.airbyte.cdk.read.SelectQuerySpec
+import io.airbyte.cdk.read.Stream
 import io.airbyte.cdk.read.Where
 import io.airbyte.cdk.read.WhereClauseNode
 import io.airbyte.cdk.read.WhereNode
 import io.airbyte.cdk.read.optimize
 import io.airbyte.cdk.util.Jsons
-import io.airbyte.cdk.read.PartitionReadCheckpoint
-import io.airbyte.cdk.read.PartitionReader
-import io.airbyte.cdk.read.Sample
-import io.airbyte.cdk.read.SelectQuerier
-import io.airbyte.cdk.read.SelectQuery
 import io.github.oshai.kotlinlogging.KotlinLogging
 import io.micronaut.context.annotation.Primary
 import io.micronaut.context.annotation.Requires
@@ -88,11 +86,11 @@ import java.util.concurrent.atomic.AtomicReference
  */
 
 /**
- * The bucketing expression `MOD(ABS(HASH(col, ...)), bucketCount)` modelled as a predicate
- * column so it can sit in the CDK's query AST as the left-hand side of an [Equal] leaf. The CDK's
- * AST node types are sealed, so a connector cannot add a new predicate node; a [DataField] is the
- * one open extension point, and [SnowflakeSourceOperations] renders this type verbatim instead of
- * quoting it as an identifier. Compares as an integer, so the bucket index binds as a parameter.
+ * The bucketing expression `MOD(ABS(HASH(col, ...)), bucketCount)` modelled as a predicate column
+ * so it can sit in the CDK's query AST as the left-hand side of an [Equal] leaf. The CDK's AST node
+ * types are sealed, so a connector cannot add a new predicate node; a [DataField] is the one open
+ * extension point, and [SnowflakeSourceOperations] renders this type verbatim instead of quoting it
+ * as an identifier. Compares as an integer, so the bucket index binds as a parameter.
  *
  * Hashes the explicit column list: `HASH(*)` is only allowed in a SELECT clause in Snowflake,
  * whereas `HASH(col, ...)` is an ordinary scalar call, legal in WHERE.
@@ -133,9 +131,14 @@ internal fun DefaultJdbcPartition.nonResumableSpec(): SelectQuerySpec =
 
 /** Generates the bucketed non-resumable query for [this] through its own query generator. */
 internal fun DefaultJdbcPartition.hashBucketQuery(bucketIndex: Int, bucketCount: Int): SelectQuery =
-    selectQueryGenerator.generate(nonResumableSpec().withHashBucket(bucketIndex, bucketCount).optimize())
+    selectQueryGenerator.generate(
+        nonResumableSpec().withHashBucket(bucketIndex, bucketCount).optimize()
+    )
 
-/** Number of buckets needed to keep each query's result set within [SnowflakeHashBucketPartitionsCreator.SAFE_QUERY_BYTES]. */
+/**
+ * Number of buckets needed to keep each query's result set within
+ * [SnowflakeHashBucketPartitionsCreator.SAFE_QUERY_BYTES].
+ */
 internal fun hashBucketCount(expectedByteSize: Long): Int {
     val safe: Long = SnowflakeHashBucketPartitionsCreator.SAFE_QUERY_BYTES
     return ((expectedByteSize + safe - 1) / safe)
@@ -170,11 +173,11 @@ class SnowflakeHashBucketPartition(
 }
 
 /**
- * Reads a partition as a sequence of bounded queries within one reader, checkpointing only once
- * the last query has been fully consumed. Used for large snapshots of any shape.
+ * Reads a partition as a sequence of bounded queries within one reader, checkpointing only once the
+ * last query has been fully consumed. Used for large snapshots of any shape.
  *
- * [JdbcPartitionReader] is sealed, so this implements [PartitionReader] directly, reproducing
- * the same resource-acquisition and output-routing plumbing.
+ * [JdbcPartitionReader] is sealed, so this implements [PartitionReader] directly, reproducing the
+ * same resource-acquisition and output-routing plumbing.
  */
 class SnowflakeMultiQueryPartitionReader(
     val jdbcPartition: JdbcPartition<*>,
@@ -198,7 +201,7 @@ class SnowflakeMultiQueryPartitionReader(
     private lateinit var outputRoute:
         (
             MutableMap<String, FieldValueEncoder<*>>,
-            Map<io.airbyte.cdk.discover.Field, FieldValueChange>?,
+            Map<EmittedField, FieldValueChange>?,
         ) -> Unit
 
     override fun tryAcquireResources(): PartitionReader.TryAcquireResourcesStatus {
@@ -386,7 +389,9 @@ class SnowflakeHashBucketPartitionsCreator(
                 "$bucketCount sequential hash-bucketed queries."
         }
         val queries: List<SelectQuery> =
-            (0 until bucketCount).map { bucketIndex: Int -> p.hashBucketQuery(bucketIndex, bucketCount) }
+            (0 until bucketCount).map { bucketIndex: Int ->
+                p.hashBucketQuery(bucketIndex, bucketCount)
+            }
         return listOf(SnowflakeMultiQueryPartitionReader(p, queries))
     }
 
@@ -404,21 +409,21 @@ class SnowflakeHashBucketPartitionsCreator(
         const val MAX_BUCKET_COUNT = 512
 
         /**
-         * Maximum estimated bytes for a single query's result set. Snowflake's staged result
-         * chunks carry credentials with a finite lifetime (~6h observed) which the JDBC driver
-         * never refreshes; a result set must be fully consumed within that lifetime, and the
-         * consumption rate is dictated by the slowest stage of the pipeline (often the
-         * destination). 512 MiB stays inside the lifetime for consumption rates down to
-         * ~25 KB/s, observed as realistic for batched destinations.
+         * Maximum estimated bytes for a single query's result set. Snowflake's staged result chunks
+         * carry credentials with a finite lifetime (~6h observed) which the JDBC driver never
+         * refreshes; a result set must be fully consumed within that lifetime, and the consumption
+         * rate is dictated by the slowest stage of the pipeline (often the destination). 512 MiB
+         * stays inside the lifetime for consumption rates down to ~25 KB/s, observed as realistic
+         * for batched destinations.
          */
         const val SAFE_QUERY_BYTES: Long = 512L shl 20 // 512 MiB
     }
 }
 
 /**
- * Factory replacing the CDK's `@Secondary` concurrent factory for this connector. `@Primary`
- * makes the bean selection explicit (as source-postgres does for its CDK overrides) rather than
- * relying solely on the CDK bean's `@Secondary` demotion.
+ * Factory replacing the CDK's `@Secondary` concurrent factory for this connector. `@Primary` makes
+ * the bean selection explicit (as source-postgres does for its CDK overrides) rather than relying
+ * solely on the CDK bean's `@Secondary` demotion.
  */
 @Singleton
 @Primary

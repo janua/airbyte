@@ -8,10 +8,10 @@ import io.airbyte.cdk.discover.EmittedField
 import io.airbyte.cdk.jdbc.IntFieldType
 import io.airbyte.cdk.jdbc.LocalDateFieldType
 import io.airbyte.cdk.jdbc.StringFieldType
+import io.airbyte.cdk.read.And
 import io.airbyte.cdk.read.From
 import io.airbyte.cdk.read.GreaterOrEqual
 import io.airbyte.cdk.read.LesserOrEqual
-import io.airbyte.cdk.read.And
 import io.airbyte.cdk.read.SelectColumns
 import io.airbyte.cdk.read.SelectQuery
 import io.airbyte.cdk.read.SelectQuerySpec
