@@ -10,6 +10,8 @@ import io.airbyte.cdk.discover.EmittedField
 import io.airbyte.cdk.read.DefaultJdbcCursorIncrementalPartition
 import io.airbyte.cdk.read.DefaultUnsplittableJdbcCursorIncrementalPartition
 import io.airbyte.cdk.read.DefaultJdbcPartition
+import io.airbyte.cdk.read.DefaultJdbcSplittablePartition
+import io.airbyte.cdk.read.DefaultJdbcUnsplittablePartition
 import io.airbyte.cdk.read.DefaultJdbcSharedState
 import io.airbyte.cdk.read.DefaultJdbcStreamState
 import io.airbyte.cdk.read.DefaultJdbcStreamStateValue
@@ -33,12 +35,15 @@ import io.airbyte.cdk.read.JdbcPartitionReader
 import io.airbyte.cdk.read.JdbcPartitionsCreator
 import io.airbyte.cdk.read.JdbcPartitionsCreatorFactory
 import io.airbyte.cdk.read.MODE_PROPERTY
+import io.airbyte.cdk.read.NoWhere
+import io.airbyte.cdk.read.optimize
 import io.airbyte.cdk.read.PartitionReadCheckpoint
 import io.airbyte.cdk.read.PartitionReader
 import io.airbyte.cdk.read.Sample
 import io.airbyte.cdk.read.SelectQuerier
 import io.airbyte.cdk.read.SelectQuery
 import io.github.oshai.kotlinlogging.KotlinLogging
+import io.micronaut.context.annotation.Primary
 import io.micronaut.context.annotation.Requires
 import jakarta.inject.Singleton
 import java.util.UUID
@@ -71,18 +76,41 @@ import java.util.concurrent.atomic.AtomicReference
  *    unchanged from stock (restart the snapshot); each query is bounded so the read completes.
  */
 
-/** Appends the hash-bucket predicate to a generated query, WHERE-aware.
+/**
+ * Appends the hash-bucket predicate to a generated query.
+ *
+ * [hasWhere] must reflect whether the generated query already carries a WHERE clause. It is
+ * derived structurally from the partition's [io.airbyte.cdk.read.SelectQuerySpec] (see
+ * [hasWhereClause]) rather than by inspecting the rendered SQL, so keyword casing and identifiers
+ * that happen to contain the word WHERE cannot mislead it.
  *
  * Hashes the explicit column list: `HASH(*)` is only allowed in a SELECT clause in Snowflake,
- * whereas `HASH(col, ...)` is an ordinary scalar call, legal in WHERE. */
-internal fun hashBucketQuery(q: SelectQuery, bucketIndex: Int, bucketCount: Int): SelectQuery {
+ * whereas `HASH(col, ...)` is an ordinary scalar call, legal in WHERE.
+ */
+internal fun hashBucketQuery(
+    q: SelectQuery,
+    hasWhere: Boolean,
+    bucketIndex: Int,
+    bucketCount: Int,
+): SelectQuery {
     require(q.columns.isNotEmpty()) { "cannot hash-bucket a query with no columns" }
     val hashArgs: String = q.columns.joinToString(", ") { "\"${it.id}\"" }
     val predicate: String = "MOD(ABS(HASH($hashArgs)), $bucketCount) = $bucketIndex"
-    val sql: String =
-        if (q.sql.contains(" WHERE ")) "${q.sql} AND $predicate" else "${q.sql} WHERE $predicate"
+    val sql: String = if (hasWhere) "${q.sql} AND $predicate" else "${q.sql} WHERE $predicate"
     return SelectQuery(sql, q.columns, q.bindings)
 }
+
+/**
+ * Whether the partition's non-resumable query renders with a WHERE clause. Mirrors the query
+ * generator, which renders `nonResumableQuerySpec.optimize()` and emits WHERE iff the optimized
+ * spec's where-node is not [NoWhere].
+ */
+internal fun DefaultJdbcPartition.hasWhereClause(): Boolean =
+    when (this) {
+        is DefaultJdbcUnsplittablePartition -> nonResumableQuerySpec.optimize().where !is NoWhere
+        is DefaultJdbcSplittablePartition -> nonResumableQuerySpec.optimize().where !is NoWhere
+        else -> error("unexpected partition type ${this::class.qualifiedName}")
+    }
 
 /** Number of buckets needed to keep each query's result set within [SnowflakeHashBucketPartitionsCreator.SAFE_QUERY_BYTES]. */
 internal fun hashBucketCount(expectedByteSize: Long): Int {
@@ -97,6 +125,7 @@ class SnowflakeHashBucketPartition(
     val parent: JdbcCursorPartition<DefaultJdbcStreamState>,
     val cursor: EmittedField,
     val cursorLowerBound: JsonNode,
+    val hasWhere: Boolean,
     val bucketIndex: Int,
     val bucketCount: Int,
 ) : JdbcPartition<DefaultJdbcStreamState> {
@@ -104,7 +133,7 @@ class SnowflakeHashBucketPartition(
     override val streamState: DefaultJdbcStreamState = parent.streamState
 
     override val nonResumableQuery: SelectQuery
-        get() = hashBucketQuery(parent.nonResumableQuery, bucketIndex, bucketCount)
+        get() = hashBucketQuery(parent.nonResumableQuery, hasWhere, bucketIndex, bucketCount)
 
     override val completeState: OpaqueStateValue
         get() =
@@ -251,9 +280,9 @@ class SnowflakeHashBucketPartitionsCreator(
         val p: DefaultJdbcPartition = partition
         return when (p) {
             is DefaultUnsplittableJdbcCursorIncrementalPartition ->
-                runCursorIncremental(p, p.cursor, p.cursorLowerBound)
+                runCursorIncremental(p, p.cursor, p.cursorLowerBound, p.hasWhereClause())
             is DefaultJdbcCursorIncrementalPartition ->
-                runCursorIncremental(p, p.cursor, p.cursorLowerBound)
+                runCursorIncremental(p, p.cursor, p.cursorLowerBound, p.hasWhereClause())
             // All snapshot shapes, splittable or not: stock splitting can silently produce
             // zero boundaries and fall back to one unbounded query, so take control of all
             // large snapshots here.
@@ -266,6 +295,7 @@ class SnowflakeHashBucketPartitionsCreator(
         incremental: JdbcCursorPartition<DefaultJdbcStreamState>,
         cursor: EmittedField,
         cursorLowerBound: JsonNode,
+        hasWhere: Boolean,
     ): List<PartitionReader> {
         ensureCursorUpperBound()
         if (streamState.cursorUpperBound == null || streamState.cursorUpperBound?.isNull == true) {
@@ -297,6 +327,7 @@ class SnowflakeHashBucketPartitionsCreator(
                     incremental,
                     cursor,
                     cursorLowerBound,
+                    hasWhere,
                     bucketIndex,
                     bucketCount,
                 )
@@ -334,9 +365,10 @@ class SnowflakeHashBucketPartitionsCreator(
             "Large snapshot: will be read by one reader running " +
                 "$bucketCount sequential hash-bucketed queries."
         }
+        val hasWhere: Boolean = p.hasWhereClause()
         val queries: List<SelectQuery> =
             (0 until bucketCount).map { bucketIndex: Int ->
-                hashBucketQuery(p.nonResumableQuery, bucketIndex, bucketCount)
+                hashBucketQuery(p.nonResumableQuery, hasWhere, bucketIndex, bucketCount)
             }
         return listOf(SnowflakeMultiQueryPartitionReader(p, queries))
     }
@@ -366,8 +398,13 @@ class SnowflakeHashBucketPartitionsCreator(
     }
 }
 
-/** Factory shadowing the CDK's `@Secondary` concurrent factory for this connector. */
+/**
+ * Factory replacing the CDK's `@Secondary` concurrent factory for this connector. `@Primary`
+ * makes the bean selection explicit (as source-postgres does for its CDK overrides) rather than
+ * relying solely on the CDK bean's `@Secondary` demotion.
+ */
 @Singleton
+@Primary
 @Requires(property = MODE_PROPERTY, value = "concurrent")
 class SnowflakeHashBucketPartitionsCreatorFactory(
     partitionFactory:

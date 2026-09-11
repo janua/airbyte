@@ -24,7 +24,7 @@ class SnowflakeHashBucketPartitionsTest {
     @Test
     fun `hashBucketQuery adds a WHERE clause when the query has none`() {
         val q = SelectQuery("""SELECT "VXID", "PERMUTIVE_ID" FROM "S"."T"""", columns, emptyList())
-        val bucketed = hashBucketQuery(q, bucketIndex = 3, bucketCount = 8)
+        val bucketed = hashBucketQuery(q, hasWhere = false, bucketIndex = 3, bucketCount = 8)
         assertEquals(
             """SELECT "VXID", "PERMUTIVE_ID" FROM "S"."T" WHERE MOD(ABS(HASH("VXID", "PERMUTIVE_ID")), 8) = 3""",
             bucketed.sql,
@@ -39,7 +39,7 @@ class SnowflakeHashBucketPartitionsTest {
                 columns,
                 emptyList(),
             )
-        val bucketed = hashBucketQuery(q, bucketIndex = 0, bucketCount = 2)
+        val bucketed = hashBucketQuery(q, hasWhere = true, bucketIndex = 0, bucketCount = 2)
         assertEquals(
             """SELECT "VXID", "PERMUTIVE_ID" FROM "S"."T" WHERE ((("CREATED_AT" >= ?))) AND ((("CREATED_AT" <= ?))) AND MOD(ABS(HASH("VXID", "PERMUTIVE_ID")), 2) = 0""",
             bucketed.sql,
@@ -50,15 +50,35 @@ class SnowflakeHashBucketPartitionsTest {
     fun `hashBucketQuery preserves columns and bindings`() {
         val bindings = listOf(SelectQuery.Binding(Jsons.textNode("2026-07-13T00:00:00"), StringFieldType))
         val q = SelectQuery("""SELECT "VXID", "PERMUTIVE_ID" FROM "S"."T" WHERE "X" >= ?""", columns, bindings)
-        val bucketed = hashBucketQuery(q, bucketIndex = 1, bucketCount = 4)
+        val bucketed = hashBucketQuery(q, hasWhere = true, bucketIndex = 1, bucketCount = 4)
         assertSame(columns, bucketed.columns)
         assertSame(bindings, bucketed.bindings)
     }
 
     @Test
+    fun `hashBucketQuery does not depend on keyword casing in the rendered SQL`() {
+        val q = SelectQuery("""select "VXID", "PERMUTIVE_ID" from "S"."T" where "X" >= ?""", columns, emptyList())
+        val bucketed = hashBucketQuery(q, hasWhere = true, bucketIndex = 1, bucketCount = 2)
+        assertEquals(
+            """select "VXID", "PERMUTIVE_ID" from "S"."T" where "X" >= ? AND MOD(ABS(HASH("VXID", "PERMUTIVE_ID")), 2) = 1""",
+            bucketed.sql,
+        )
+    }
+
+    @Test
+    fun `hashBucketQuery is not misled by identifiers containing the word WHERE`() {
+        val q = SelectQuery("""SELECT "VXID", "PERMUTIVE_ID" FROM "S"."MY WHERE TABLE"""", columns, emptyList())
+        val bucketed = hashBucketQuery(q, hasWhere = false, bucketIndex = 0, bucketCount = 2)
+        assertEquals(
+            """SELECT "VXID", "PERMUTIVE_ID" FROM "S"."MY WHERE TABLE" WHERE MOD(ABS(HASH("VXID", "PERMUTIVE_ID")), 2) = 0""",
+            bucketed.sql,
+        )
+    }
+
+    @Test
     fun `hashBucketQuery rejects a query with no columns to hash`() {
         val q = SelectQuery("""SELECT 1 FROM "S"."T"""", emptyList(), emptyList())
-        assertThrows(IllegalArgumentException::class.java) { hashBucketQuery(q, 0, 2) }
+        assertThrows(IllegalArgumentException::class.java) { hashBucketQuery(q, false, 0, 2) }
     }
 
     @Test
