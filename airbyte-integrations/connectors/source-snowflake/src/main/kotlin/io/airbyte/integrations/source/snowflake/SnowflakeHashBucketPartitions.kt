@@ -197,7 +197,7 @@ class SnowflakeMultiQueryPartitionReader(
     private val partitionId: String = UUID.randomUUID().toString().replace("-", "").take(8)
     private val acquiredResources =
         AtomicReference<Map<ResourceType, JdbcPartitionReader.AcquiredResource>>()
-    private lateinit var outputMessageRouter: OutputMessageRouter
+    private var outputMessageRouter: OutputMessageRouter? = null
     private lateinit var outputRoute:
         (
             MutableMap<String, FieldValueEncoder<*>>,
@@ -218,7 +218,7 @@ class SnowflakeMultiQueryPartitionReader(
             jdbcPartition.tryAcquireResourcesForReader(resourceTypes)
                 ?: return PartitionReader.TryAcquireResourcesStatus.RETRY_LATER
         acquiredResources.set(resources)
-        outputMessageRouter =
+        val router =
             OutputMessageRouter(
                 streamState.streamFeedBootstrap.dataChannelMedium,
                 streamState.streamFeedBootstrap.dataChannelFormat,
@@ -230,7 +230,8 @@ class SnowflakeMultiQueryPartitionReader(
                     .map { it.key to it.value.resource!! }
                     .toMap(),
             )
-        outputRoute = outputMessageRouter.recordAcceptors[stream.id]!!
+        outputMessageRouter = router
+        outputRoute = router.recordAcceptors[stream.id]!!
         return PartitionReader.TryAcquireResourcesStatus.READY_TO_RUN
     }
 
@@ -269,9 +270,8 @@ class SnowflakeMultiQueryPartitionReader(
     }
 
     override fun releaseResources() {
-        if (::outputMessageRouter.isInitialized) {
-            outputMessageRouter.close()
-        }
+        outputMessageRouter?.close()
+        outputMessageRouter = null
         acquiredResources.getAndSet(null)?.forEach { it.value.close() }
     }
 }
