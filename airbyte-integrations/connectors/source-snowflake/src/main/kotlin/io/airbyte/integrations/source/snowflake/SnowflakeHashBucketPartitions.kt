@@ -174,9 +174,9 @@ internal fun DefaultJdbcPartition.rowCountQuery(): SelectQuery =
     selectQueryGenerator.generate(nonResumableSpec().asRowCount().optimize())
 
 /**
- * Bytes a read is expected to produce. The CDK sample weight is a floor once the sample saturates (
- * [Sample.Kind.LARGE]: 1024 rows at 1/65536 caps the estimate near 67M rows whatever the table
- * holds), so in that case the size comes from an exact row count times the mean sampled row size.
+ * Estimated bytes in the read. Normally: scale the sample up. But the sample stops at 1024 rows, so
+ * for tables over ~67M rows it looks the same and the estimate comes out too small. When that
+ * happens ([Sample.Kind.LARGE]), use a real row count times the average sampled row size instead.
  */
 internal fun estimateByteSize(sample: Sample<Long>, rowCount: Long?): Long {
     val fromSample: Long = sample.sampledValues.sum() * sample.valueWeight
