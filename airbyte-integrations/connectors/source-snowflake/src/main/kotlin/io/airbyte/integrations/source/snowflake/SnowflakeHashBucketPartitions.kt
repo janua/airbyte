@@ -63,26 +63,14 @@ import java.util.concurrent.atomic.AtomicReference
 /*
  * Large single-query reads.
  *
- * Snowflake stages large query results as chunks in cloud storage, downloaded via credentials
- * minted when the query completes and never refreshed by the JDBC driver (observed lifetime
- * ~6h). A partition whose single result set takes longer than that to consume fails with
- * `Max retry reached for the download of chunk#N ... HTTP status=403`, makes no forward
- * progress, and every retry repeats the same read. How long a result set takes to consume is
- * set by the slowest stage of the pipeline (typically the destination), so the only robust
- * defence is to keep every individual query's result set small.
- *
- * This connector therefore subdivides any read estimated above [SAFE_QUERY_BYTES] with
- * `MOD(ABS(HASH(col, ...)), n) = ?` predicates into n disjoint, jointly-complete result sets,
- * each consumed well within the credential lifetime. This applies regardless of partition shape
- * (cold-start snapshots with or without a primary key, cursor-incremental windows) and
- * regardless of cursor cardinality. State handling differs by shape:
- *  - Cursor-incremental windows run as parallel bucket readers. `FeedReader` publishes
- *    checkpoints serially in partition-list order, so all buckets except the last report the
- *    window lower bound (no forward progress) and only the last reports the upper bound: a
- *    failure anywhere resumes from the original window. Duplicates possible, data loss not.
- *  - Snapshots run sequentially inside ONE reader with a single end-of-partition checkpoint,
- *    because no state encoding exists for "snapshot partially complete". Crash semantics are
- *    unchanged from stock (restart the snapshot); each query is bounded so the read completes.
+ * Snowflake stages large query results as chunks whose download credentials expire (~6h observed)
+ * and are never refreshed by the JDBC driver, so a result set that takes longer than that to consume
+ * fails with `Max retry reached for the download of chunk#N ... HTTP status=403` and never makes
+ * progress. This connector subdivides any read estimated above [SAFE_QUERY_BYTES], whatever its
+ * partition shape, with `MOD(ABS(HASH(col, ...)), n) = ?` predicates into n disjoint,
+ * jointly-complete queries small enough to be consumed within that lifetime. Cursor-incremental
+ * windows fan out into parallel bucket readers; snapshots run their buckets sequentially in one
+ * reader with a single end-of-partition checkpoint.
  */
 
 /**
@@ -146,7 +134,12 @@ internal fun hashBucketCount(expectedByteSize: Long): Int {
         .toInt()
 }
 
-/** One of [bucketCount] hash buckets subdividing a cursor-incremental partition's window. */
+/**
+ * One of [bucketCount] hash buckets subdividing a cursor-incremental partition's window. Buckets
+ * run in parallel and [io.airbyte.cdk.read.FeedReader] publishes checkpoints in list order, so
+ * every bucket but the last reports the window's lower bound and only the last reports the upper
+ * bound: a failure anywhere resumes from the original window (duplicates possible, data loss not).
+ */
 class SnowflakeHashBucketPartition(
     val parent: DefaultJdbcPartition,
     val cursor: EmittedField,
@@ -409,22 +402,14 @@ class SnowflakeHashBucketPartitionsCreator(
         const val MAX_BUCKET_COUNT = 512
 
         /**
-         * Maximum estimated bytes for a single query's result set. Snowflake's staged result chunks
-         * carry credentials with a finite lifetime (~6h observed) which the JDBC driver never
-         * refreshes; a result set must be fully consumed within that lifetime, and the consumption
-         * rate is dictated by the slowest stage of the pipeline (often the destination). 512 MiB
-         * stays inside the lifetime for consumption rates down to ~25 KB/s, observed as realistic
-         * for batched destinations.
+         * Maximum estimated result-set bytes per query, sized so each query is consumed well within
+         * the staged-chunk credential lifetime even at slow (~25 KB/s) destination rates.
          */
         const val SAFE_QUERY_BYTES: Long = 512L shl 20 // 512 MiB
     }
 }
 
-/**
- * Factory replacing the CDK's `@Secondary` concurrent factory for this connector. `@Primary` makes
- * the bean selection explicit (as source-postgres does for its CDK overrides) rather than relying
- * solely on the CDK bean's `@Secondary` demotion.
- */
+/** Replaces the CDK's `@Secondary` concurrent factory with one that hash-buckets large reads. */
 @Singleton
 @Primary
 @Requires(property = MODE_PROPERTY, value = "concurrent")
