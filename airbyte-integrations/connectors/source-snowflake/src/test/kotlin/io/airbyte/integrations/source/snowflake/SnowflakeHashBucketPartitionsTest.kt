@@ -12,6 +12,7 @@ import io.airbyte.cdk.read.And
 import io.airbyte.cdk.read.From
 import io.airbyte.cdk.read.GreaterOrEqual
 import io.airbyte.cdk.read.LesserOrEqual
+import io.airbyte.cdk.read.Sample
 import io.airbyte.cdk.read.SelectColumns
 import io.airbyte.cdk.read.SelectQuery
 import io.airbyte.cdk.read.SelectQuerySpec
@@ -20,6 +21,7 @@ import io.airbyte.cdk.read.optimize
 import io.airbyte.cdk.util.Jsons
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertThrows
+import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
 
 class SnowflakeHashBucketPartitionsTest {
@@ -35,7 +37,7 @@ class SnowflakeHashBucketPartitionsTest {
     @Test
     fun `adds a WHERE clause when the spec has none`() {
         val spec = SelectQuerySpec(SelectColumns(listOf(vxid, permutiveId)), from)
-        val q = render(spec.withHashBucket(bucketIndex = 3, bucketCount = 8))
+        val q = render(spec.withHashBucket(spec.projectedColumns, bucketIndex = 3, bucketCount = 8))
         assertEquals(
             """SELECT "VXID", "PERMUTIVE_ID" FROM "S"."T" WHERE MOD(ABS(HASH("VXID", "PERMUTIVE_ID")), 8) = ?""",
             q.sql,
@@ -53,7 +55,7 @@ class SnowflakeHashBucketPartitionsTest {
                 from,
                 Where(And(GreaterOrEqual(createdAt, lower), LesserOrEqual(createdAt, upper))),
             )
-        val q = render(spec.withHashBucket(bucketIndex = 0, bucketCount = 2))
+        val q = render(spec.withHashBucket(spec.projectedColumns, bucketIndex = 0, bucketCount = 2))
         assertEquals(
             """SELECT "VXID", "PERMUTIVE_ID", "CREATED_AT" FROM "S"."T" WHERE ("CREATED_AT" >= ?) AND ("CREATED_AT" <= ?) AND (MOD(ABS(HASH("VXID", "PERMUTIVE_ID", "CREATED_AT")), 2) = ?)""",
             q.sql,
@@ -72,11 +74,70 @@ class SnowflakeHashBucketPartitionsTest {
     fun `identifiers are quoted by the generator, so odd names cannot break the predicate`() {
         val odd = EmittedField("my WHERE column", StringFieldType)
         val spec = SelectQuerySpec(SelectColumns(listOf(odd)), From("MY WHERE TABLE", "S"))
-        val q = render(spec.withHashBucket(bucketIndex = 1, bucketCount = 2))
+        val q = render(spec.withHashBucket(spec.projectedColumns, bucketIndex = 1, bucketCount = 2))
         assertEquals(
             """SELECT "my WHERE column" FROM "S"."MY WHERE TABLE" WHERE MOD(ABS(HASH("my WHERE column")), 2) = ?""",
             q.sql,
         )
+    }
+
+    @Test
+    fun `hashes only the primary key when the stream has one`() {
+        val projected = listOf(vxid, permutiveId, createdAt)
+        assertEquals(listOf(vxid), hashColumnsFor(listOf(vxid), createdAt, projected))
+        assertEquals(
+            listOf(vxid, permutiveId),
+            hashColumnsFor(listOf(vxid, permutiveId), createdAt, projected),
+        )
+        val spec = SelectQuerySpec(SelectColumns(projected), from)
+        val q = render(spec.withHashBucket(listOf(vxid), bucketIndex = 0, bucketCount = 4))
+        assertEquals(
+            """SELECT "VXID", "PERMUTIVE_ID", "CREATED_AT" FROM "S"."T" WHERE MOD(ABS(HASH("VXID")), 4) = ?""",
+            q.sql,
+        )
+    }
+
+    @Test
+    fun `without a primary key, hashes the projected columns except the cursor`() {
+        val projected = listOf(vxid, permutiveId, createdAt)
+        assertEquals(listOf(vxid, permutiveId), hashColumnsFor(null, createdAt, projected))
+        assertEquals(listOf(vxid, permutiveId), hashColumnsFor(emptyList(), createdAt, projected))
+        // No cursor: everything is hashed.
+        assertEquals(projected, hashColumnsFor(null, null, projected))
+        // The cursor is the only column: it has to be hashed.
+        assertEquals(listOf(createdAt), hashColumnsFor(null, createdAt, listOf(createdAt)))
+    }
+
+    @Test
+    fun `row count query keeps the partition's WHERE clause and bindings`() {
+        val lower = Jsons.textNode("2026-06-29")
+        val spec =
+            SelectQuerySpec(
+                SelectColumns(listOf(vxid, createdAt)),
+                from,
+                Where(GreaterOrEqual(createdAt, lower)),
+            )
+        val q = render(spec.asRowCount())
+        assertEquals("""SELECT COUNT(*) FROM "S"."T" WHERE "CREATED_AT" >= ?""", q.sql)
+        assertEquals(listOf(SelectQuery.Binding(lower, LocalDateFieldType)), q.bindings)
+        assertEquals(listOf(SnowflakeRowCountColumn), q.columns)
+    }
+
+    @Test
+    fun `saturated samples are sized from the row count, others from the sample weight`() {
+        val rows = List(1024) { 100L } // 1024 sampled rows of 100 bytes
+        val large = Sample(rows, Sample.Kind.LARGE, 65_536L)
+        val fromWeight = 1024L * 100 * 65_536 // what the CDK alone would estimate: ~6.4 GiB
+        assertEquals(fromWeight, estimateByteSize(large, rowCount = null))
+        assertEquals(300_000_000L * 100, estimateByteSize(large, rowCount = 300_000_000L))
+        assertTrue(
+            hashBucketCount(estimateByteSize(large, 300_000_000L)) > hashBucketCount(fromWeight)
+        )
+        // A count never shrinks the estimate below what the sample already implies.
+        assertEquals(fromWeight, estimateByteSize(large, rowCount = 10L))
+        // Non-saturated kinds ignore the count.
+        val medium = Sample(rows, Sample.Kind.MEDIUM, 256L)
+        assertEquals(1024L * 100 * 256, estimateByteSize(medium, rowCount = 300_000_000L))
     }
 
     @Test

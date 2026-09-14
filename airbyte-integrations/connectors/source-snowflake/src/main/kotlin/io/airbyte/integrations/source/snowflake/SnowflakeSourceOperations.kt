@@ -152,7 +152,7 @@ class SnowflakeSourceOperations() :
     fun DataField.sql(): String =
         when (this) {
             // An expression standing in for a column: already rendered SQL, not an identifier.
-            is SnowflakeHashBucketColumn -> id
+            is SnowflakeSqlExpression -> id
             else -> "\"$id\""
         }
 
