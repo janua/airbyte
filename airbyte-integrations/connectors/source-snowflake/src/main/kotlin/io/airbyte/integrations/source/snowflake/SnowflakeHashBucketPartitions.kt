@@ -68,35 +68,38 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /*
- * Large single-query reads.
+ * Splitting big reads into smaller queries.
  *
- * Snowflake stages large query results as chunks whose download credentials expire (~6h observed)
- * and are never refreshed by the JDBC driver, so a result set that takes longer than that to consume
- * fails with `Max retry reached for the download of chunk#N ... HTTP status=403` and never makes
- * progress. This connector subdivides any read estimated above [SAFE_QUERY_BYTES], whatever its
- * partition shape, with `MOD(ABS(HASH(col, ...)), n) = ?` predicates into n disjoint,
- * jointly-complete queries small enough to be consumed within that lifetime. Cursor-incremental
- * windows fan out into parallel bucket readers; snapshots run their buckets sequentially in one
- * reader with a single end-of-partition checkpoint.
+ * When a query returns a lot of data, Snowflake stores the result in chunks and gives the JDBC
+ * driver temporary links to download them. The links expire after about 6 hours and the driver
+ * never renews them. If Airbyte takes longer than that to pull the result down (usually because the
+ * destination is slow), the download fails with
+ * `Max retry reached for the download of chunk#N ... HTTP status=403` and the sync gets nowhere.
+ *
+ * The fix: if a read looks bigger than [SAFE_QUERY_BYTES], split it into n smaller queries using
+ * `MOD(ABS(HASH(col, ...)), n) = ?`. Every row lands in exactly one of the n queries, and each
+ * query is small enough to download before its links expire. This is done for every kind of read.
+ * Reads of a cursor window run their n queries in parallel; full-table reads run them one after
+ * another.
  */
 
 /**
- * A SQL expression standing in for a column in the CDK's query AST. The AST node types are sealed,
- * so a connector cannot add nodes of its own; a [DataField] is the one open extension point, and
- * [SnowflakeSourceOperations] renders these verbatim instead of quoting them as identifiers.
+ * A piece of SQL that stands in for a column. The CDK query model cannot be given new node types,
+ * but any [DataField] can go where a column goes, and [SnowflakeSourceOperations] writes these out
+ * as-is instead of quoting them like a column name.
  */
 sealed interface SnowflakeSqlExpression : DataField
 
-/** `COUNT(*)`, used to size a large read exactly when the row sample has saturated. */
+/** `COUNT(*)`. Used to size a big read when the sample cannot tell us how big it is. */
 data object SnowflakeRowCountColumn : SnowflakeSqlExpression {
     override val id: String = "COUNT(*)"
     override val type: FieldType = LongFieldType
 }
 
 /**
- * The bucketing predicate's left-hand side, `MOD(ABS(HASH(col, ...)), bucketCount)`. Compares as an
- * integer, so the bucket index binds as a parameter. Hashes an explicit column list because
- * `HASH(*)` is only legal in a SELECT clause in Snowflake.
+ * The `MOD(ABS(HASH(col, ...)), bucketCount)` part of the bucket filter. It is compared to an
+ * integer, so the bucket number is passed as a query parameter. The columns are listed out because
+ * Snowflake only allows `HASH(*)` in a SELECT, not in a WHERE.
  */
 data class SnowflakeHashBucketColumn(
     val hashedColumns: List<DataField>,
@@ -111,11 +114,12 @@ data class SnowflakeHashBucketColumn(
 }
 
 /**
- * Columns whose hash assigns a row to a bucket. Any deterministic subset keeps the buckets disjoint
- * and complete; the choice only affects balance and stability. A primary key gives both, so it is
- * preferred. Without one, the cursor is left out because cursor columns are the ones most often
- * derived (e.g. `DATE(MAX(...))` in a view), and a value that changes between bucket queries would
- * move rows between buckets already read and buckets still to come.
+ * Which columns to hash. Any fixed set of columns works: every row still lands in exactly one
+ * bucket. The choice only affects how evenly rows spread out, and whether a row stays in the same
+ * bucket from one query to the next. A primary key does both well, so use it if there is one.
+ * Otherwise hash everything except the cursor. Cursor columns in views are often computed (for
+ * example `DATE(MAX(...))`). If that value changed between queries, rows would jump between buckets
+ * already read and buckets not yet read, so some rows would be read twice and others missed.
  */
 internal fun hashColumnsFor(
     configuredPrimaryKey: List<EmittedField>?,
@@ -127,11 +131,11 @@ internal fun hashColumnsFor(
     return stable.ifEmpty { projected }
 }
 
-/** The projected columns of [this], which must be a plain column projection. */
+/** The columns this query selects. Fails if the query is not a plain column list. */
 internal val SelectQuerySpec.projectedColumns: List<DataField>
     get() = (select as? SelectColumns)?.columns ?: error("expected a column projection")
 
-/** Restricts [this] to hash bucket [bucketIndex] of [bucketCount] by extending its WHERE clause. */
+/** Adds "and this row is in bucket [bucketIndex] of [bucketCount]" to the WHERE clause. */
 internal fun SelectQuerySpec.withHashBucket(
     hashColumns: List<DataField>,
     bucketIndex: Int,
@@ -147,7 +151,7 @@ internal fun SelectQuerySpec.withHashBucket(
     return copy(where = Where(clause))
 }
 
-/** The non-resumable query spec of a default partition, regardless of splittability. */
+/** The plain "read everything in this partition" query, for either kind of default partition. */
 internal fun DefaultJdbcPartition.nonResumableSpec(): SelectQuerySpec =
     when (this) {
         is DefaultJdbcUnsplittablePartition -> nonResumableQuerySpec
@@ -155,7 +159,7 @@ internal fun DefaultJdbcPartition.nonResumableSpec(): SelectQuerySpec =
         else -> error("unexpected partition type ${this::class.qualifiedName}")
     }
 
-/** Generates the bucketed non-resumable query for [this] through its own query generator. */
+/** The partition's read-everything query, restricted to one bucket. */
 internal fun DefaultJdbcPartition.hashBucketQuery(bucketIndex: Int, bucketCount: Int): SelectQuery {
     val spec: SelectQuerySpec = nonResumableSpec()
     val stream: Stream = streamState.stream
@@ -166,7 +170,7 @@ internal fun DefaultJdbcPartition.hashBucketQuery(bucketIndex: Int, bucketCount:
     )
 }
 
-/** `SELECT COUNT(*)` over exactly the rows [this] partition's non-resumable query would read. */
+/** `SELECT COUNT(*)` over the same rows the partition's read-everything query would return. */
 internal fun SelectQuerySpec.asRowCount(): SelectQuerySpec =
     copy(select = SelectColumns(listOf(SnowflakeRowCountColumn)))
 
@@ -175,8 +179,8 @@ internal fun DefaultJdbcPartition.rowCountQuery(): SelectQuery =
 
 /**
  * Estimated bytes in the read. Normally: scale the sample up. But the sample stops at 1024 rows, so
- * for tables over ~67M rows it looks the same and the estimate comes out too small. When that
- * happens ([Sample.Kind.LARGE]), use a real row count times the average sampled row size instead.
+ * every table over ~67M rows gives the same sample and the same too-small estimate. When that
+ * happens ([Sample.Kind.LARGE]), ask for a real row count and multiply by the average row size.
  */
 internal fun estimateByteSize(sample: Sample<Long>, rowCount: Long?): Long {
     val fromSample: Long = sample.sampledValues.sum() * sample.valueWeight
@@ -188,7 +192,7 @@ internal fun estimateByteSize(sample: Sample<Long>, rowCount: Long?): Long {
 }
 
 /**
- * Number of buckets needed to keep each query's result set within
+ * How many buckets it takes to keep each query under
  * [SnowflakeHashBucketPartitionsCreator.SAFE_QUERY_BYTES].
  */
 internal fun hashBucketCount(expectedByteSize: Long): Int {
@@ -199,10 +203,10 @@ internal fun hashBucketCount(expectedByteSize: Long): Int {
 }
 
 /**
- * One of [bucketCount] hash buckets subdividing a cursor-incremental partition's window. Buckets
- * run in parallel and [io.airbyte.cdk.read.FeedReader] publishes checkpoints in list order, so
- * every bucket but the last reports the window's lower bound and only the last reports the upper
- * bound: a failure anywhere resumes from the original window (duplicates possible, data loss not).
+ * One bucket of a cursor window. All buckets run at the same time. When a bucket finishes it
+ * reports a checkpoint, and the CDK saves checkpoints in bucket order. So every bucket except the
+ * last reports "still at the start of the window", and only the last reports "window done". If any
+ * bucket fails, the next sync starts the window again: some rows may be read twice, none are lost.
  */
 class SnowflakeHashBucketPartition(
     val parent: DefaultJdbcPartition,
@@ -230,11 +234,11 @@ class SnowflakeHashBucketPartition(
 }
 
 /**
- * Reads a partition as a sequence of bounded queries within one reader, checkpointing only once the
- * last query has been fully consumed. Used for large snapshots of any shape.
+ * Runs several queries one after another and only checkpoints when the last one has finished. Used
+ * for big full-table reads, which have no way to record "partly done".
  *
- * [JdbcPartitionReader] is sealed, so this implements [PartitionReader] directly, reproducing the
- * same resource-acquisition and output-routing plumbing.
+ * The CDK's [JdbcPartitionReader] cannot be extended, so this implements [PartitionReader] directly
+ * and copies the same resource and output handling.
  */
 class SnowflakeMultiQueryPartitionReader(
     val jdbcPartition: JdbcPartition<*>,
@@ -312,7 +316,7 @@ class SnowflakeMultiQueryPartitionReader(
         runComplete.set(true)
     }
 
-    /** Mirrors [JdbcPartitionReader]: drain state and status messages queued for SOCKET output. */
+    /** Same as the stock reader: send any queued state and status messages first (SOCKET mode). */
     private fun outputPendingMessages() {
         if (streamState.streamFeedBootstrap.dataChannelMedium == DataChannelMedium.STDIO) return
         val router: OutputMessageRouter = outputMessageRouter ?: return
@@ -324,9 +328,7 @@ class SnowflakeMultiQueryPartitionReader(
         }
     }
 
-    /**
-     * Mirrors [JdbcPartitionReader]: refuse to start once the configured snapshot budget is spent.
-     */
+    /** Same as the stock reader: do not start if the sync has used up its snapshot time limit. */
     private fun checkMaxReadTimeElapsed() {
         val max: Duration = sharedState.configuration.maxSnapshotReadDuration ?: return
         if (Duration.between(sharedState.snapshotReadStartTime, Instant.now()) > max) {
@@ -358,9 +360,8 @@ class SnowflakeMultiQueryPartitionReader(
 }
 
 /**
- * [io.airbyte.cdk.read.PartitionsCreator] which detects large single-query reads and subdivides
- * them with hash-bucket predicates. Everything else delegates to the stock
- * [JdbcConcurrentPartitionsCreator].
+ * Decides how to read a partition. Big reads are split into hash buckets; everything else is handed
+ * to the stock [JdbcConcurrentPartitionsCreator] unchanged.
  */
 class SnowflakeHashBucketPartitionsCreator(
     partition: DefaultJdbcPartition,
@@ -374,7 +375,7 @@ class SnowflakeHashBucketPartitionsCreator(
 
     private val log = KotlinLogging.logger {}
 
-    /** The one sample this creator takes; the delegate reuses it instead of sampling again. */
+    /** The sample taken by this creator. The stock creator reuses it rather than sampling again. */
     private var cachedSample: Sample<SelectQuerier.ResultRow>? = null
 
     private val delegate:
@@ -420,14 +421,14 @@ class SnowflakeHashBucketPartitionsCreator(
                 runCursorIncremental(p, p.cursor, p.cursorLowerBound)
             is DefaultJdbcCursorIncrementalPartition ->
                 runCursorIncremental(p, p.cursor, p.cursorLowerBound)
-            // All snapshot shapes, splittable or not: stock splitting can silently produce
-            // zero boundaries and fall back to one unbounded query, so take control of all
-            // large snapshots here.
+            // Every kind of full-table read, with or without a primary key. The stock splitter
+            // can end up with no split points and fall back to one giant query, so big
+            // full-table reads are handled here instead.
             else -> runSnapshot(p)
         }
     }
 
-    /** Large cursor windows fan out into parallel bucket readers. */
+    /** A big cursor window is read as several buckets in parallel. */
     private suspend fun runCursorIncremental(
         incremental: DefaultJdbcPartition,
         cursor: EmittedField,
@@ -468,7 +469,7 @@ class SnowflakeHashBucketPartitionsCreator(
         }
     }
 
-    /** Large snapshots of any shape are read as one reader running bounded queries sequentially. */
+    /** A big full-table read is done as several buckets, one after another, in a single reader. */
     private suspend fun runSnapshot(p: DefaultJdbcPartition): List<PartitionReader> {
         if (p is JdbcCursorPartition<*>) {
             ensureCursorUpperBound()
@@ -517,14 +518,14 @@ class SnowflakeHashBucketPartitionsCreator(
         const val MAX_BUCKET_COUNT = 512
 
         /**
-         * Maximum estimated result-set bytes per query, sized so each query is consumed well within
-         * the staged-chunk credential lifetime even at slow (~25 KB/s) destination rates.
+         * Biggest result we let one query return. Small enough to download before Snowflake's links
+         * expire, even for a slow destination pulling ~25 KB/s.
          */
         const val SAFE_QUERY_BYTES: Long = 512L shl 20 // 512 MiB
     }
 }
 
-/** Replaces the CDK's `@Secondary` concurrent factory with one that hash-buckets large reads. */
+/** Takes the place of the CDK's concurrent factory so that big reads get hash-bucketed. */
 @Singleton
 @Primary
 @Requires(property = MODE_PROPERTY, value = "concurrent")
