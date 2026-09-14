@@ -124,7 +124,7 @@ class SnowflakeHashBucketPartitionsTest {
     }
 
     @Test
-    fun `when the sample hit its row limit, size from the row count; otherwise from the sample`() {
+    fun `sizes from the row count when the sample hit its row limit, otherwise from the sample`() {
         val rows = List(1024) { 100L } // 1024 sampled rows of 100 bytes
         val large = Sample(rows, Sample.Kind.LARGE, 65_536L)
         val fromWeight = 1024L * 100 * 65_536 // what the CDK alone would estimate: ~6.4 GiB
