@@ -404,7 +404,7 @@ class SnowflakeHashBucketPartitionsCreator(
         }
 
     private fun countRows(p: DefaultJdbcPartition): Long? {
-        log.info { "Row sample saturated; counting rows to size the read." }
+        log.info { "Sample hit its 1024-row limit; counting rows to size the read." }
         val record =
             selectQuerier.executeQuery(p.rowCountQuery()).use {
                 if (it.hasNext()) it.next().data.toJson() else null
