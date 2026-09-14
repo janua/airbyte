@@ -124,7 +124,7 @@ class SnowflakeHashBucketPartitionsTest {
     }
 
     @Test
-    fun `saturated samples are sized from the row count, others from the sample weight`() {
+    fun `when the sample hit its row limit, size from the row count; otherwise from the sample`() {
         val rows = List(1024) { 100L } // 1024 sampled rows of 100 bytes
         val large = Sample(rows, Sample.Kind.LARGE, 65_536L)
         val fromWeight = 1024L * 100 * 65_536 // what the CDK alone would estimate: ~6.4 GiB
@@ -135,7 +135,7 @@ class SnowflakeHashBucketPartitionsTest {
         )
         // A count never shrinks the estimate below what the sample already implies.
         assertEquals(fromWeight, estimateByteSize(large, rowCount = 10L))
-        // Non-saturated kinds ignore the count.
+        // A sample that did not hit its limit is trusted as-is; the count is ignored.
         val medium = Sample(rows, Sample.Kind.MEDIUM, 256L)
         assertEquals(1024L * 100 * 256, estimateByteSize(medium, rowCount = 300_000_000L))
     }
