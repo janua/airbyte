@@ -199,6 +199,58 @@ class JdbcPartitionsCreatorTest {
     }
 
     @Test
+    fun testConcurrentSnapshotOfLargeTable() {
+        val stream = stream(withCursor = false)
+        fun samplingQuery(
+            sampleRateInvPow2: Int,
+            vararg rows: NativeRecordPayload
+        ): TestFixtures.MockedQuery =
+            TestFixtures.MockedQuery(
+                expectedQuerySpec =
+                    SelectQuerySpec(
+                        SelectColumns(id, ts, msg),
+                        FromSample(
+                            stream().name,
+                            stream().namespace,
+                            sampleRateInvPow2,
+                            sampleSize = 4,
+                            where = NoWhere
+                        ),
+                        NoWhere,
+                        OrderBy(id)
+                    ),
+                expectedParameters = SelectQuerier.Parameters(fetchSize = null),
+                *rows,
+            )
+        val fullSample: Array<NativeRecordPayload> =
+            arrayOf(
+                idDateString(10000, "2024-08-01", "foo"),
+                idDateString(20000, "2024-08-02", "bar"),
+                idDateString(30000, "2024-08-03", "baz"),
+                idDateString(40000, "2024-08-04", "quux"),
+            )
+        val sharedState =
+            sharedState(
+                constants = DefaultJdbcConstants(withSampling = true, maxSampleSize = 4),
+                mockedQueries =
+                    arrayOf(
+                        samplingQuery(16, *fullSample),
+                        samplingQuery(20, *fullSample),
+                        samplingQuery(24, idDateString(10000, "2024-08-01", "foo")),
+                    ),
+            )
+        val factory = sharedState.factory()
+        val initialPartition =
+            factory.create(stream.bootstrap(opaqueStateValue = null)).asPartition()
+        factory.assertFailures()
+        val readers = JdbcConcurrentPartitionsCreator(initialPartition, factory).runInTest()
+        val partitions: List<DefaultJdbcSplittableSnapshotPartition> =
+            concurrentPartitions(stream, readers)
+        // Weighing the sample by 1 / 2^16 instead would estimate the table to fit in one partition.
+        Assertions.assertEquals(5, partitions.size)
+    }
+
+    @Test
     fun testConcurrentSnapshotWithoutSampling() {
         val stream = stream(withCursor = false)
         val sharedState = sharedState()

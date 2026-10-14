@@ -130,11 +130,42 @@ abstract class JdbcPartitionsCreator<
                     else -> Sample.Kind.SMALL
                 }
             log.info { "Sampled ${values.size} rows in ${kind.name} stream '${stream.label}'." }
+            if (kind == Sample.Kind.LARGE) {
+                return Sample(values, kind, largeSampleWeight(sampleRateInvPow2))
+            }
             return Sample(values, kind, previousWeight.coerceAtLeast(sampleRateInv))
         }
         val kind: Sample.Kind = if (values.isEmpty()) Sample.Kind.EMPTY else Sample.Kind.TINY
         log.info { "Sampled ${values.size} rows in ${kind.name} stream '${stream.label}'." }
         return Sample(values, kind, if (values.isEmpty()) 0L else 1L)
+    }
+
+    /**
+     * A full sample at the sparsest rate only shows that the partition has at least that many rows,
+     * however large it is. Counts rows at sparser rates until a sample comes back short, and weighs
+     * by that count instead, so that the estimated size grows with the partition.
+     */
+    private fun largeSampleWeight(fullSampleRateInvPow2: Int): Long {
+        var sampleRateInvPow2: Int = fullSampleRateInvPow2
+        while (sampleRateInvPow2 < MAX_SAMPLE_RATE_INV_POW2) {
+            sampleRateInvPow2 += 4
+            val sampleRateInv: Long = 1L shl sampleRateInvPow2
+            log.info { "Sampling stream '${stream.label}' at rate 1 / $sampleRateInv." }
+            val count: Int =
+                selectQuerier.executeQuery(partition.samplingQuery(sampleRateInvPow2)).use {
+                    it.asSequence().count()
+                }
+            if (count < sharedState.maxSampleSize) {
+                val weight: Long = sampleRateInv * count / sharedState.maxSampleSize
+                log.info { "Weighing sampled rows in stream '${stream.label}' by $weight." }
+                return weight.coerceAtLeast(1L shl fullSampleRateInvPow2)
+            }
+        }
+        return 1L shl MAX_SAMPLE_RATE_INV_POW2
+    }
+
+    companion object {
+        const val MAX_SAMPLE_RATE_INV_POW2: Int = 28
     }
 }
 
