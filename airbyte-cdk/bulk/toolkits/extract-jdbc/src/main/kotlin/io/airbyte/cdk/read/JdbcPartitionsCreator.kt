@@ -136,6 +136,39 @@ abstract class JdbcPartitionsCreator<
         log.info { "Sampled ${values.size} rows in ${kind.name} stream '${stream.label}'." }
         return Sample(values, kind, if (values.isEmpty()) 0L else 1L)
     }
+
+    /**
+     * A [Sample.Kind.LARGE] sample is full at the sparsest rate in [collectSample], which only
+     * shows that the partition has at least [JdbcSharedState.maxSampleSize] times
+     * [fullSampleWeight] rows, however many it really has. Samples at sparser rates until one comes
+     * back short, and returns the weight implied by its row count.
+     */
+    protected fun largeSampleWeight(fullSampleWeight: Long): Long {
+        for (sampleRateInvPow2 in SPARSER_SAMPLE_RATES_INV_POW2) {
+            val sampleRateInv: Long = 1L shl sampleRateInvPow2
+            log.info { "Sampling stream '${stream.label}' at rate 1 / $sampleRateInv." }
+            val count: Int =
+                selectQuerier.executeQuery(partition.samplingQuery(sampleRateInvPow2)).use {
+                    it.asSequence().count()
+                }
+            if (count < sharedState.maxSampleSize) {
+                val weight: Long =
+                    (sampleRateInv * count / sharedState.maxSampleSize).coerceAtLeast(
+                        fullSampleWeight,
+                    )
+                log.info { "Weighing sampled rows in stream '${stream.label}' by $weight." }
+                return weight
+            }
+        }
+        val weight: Long = 1L shl SPARSER_SAMPLE_RATES_INV_POW2.last()
+        log.warn { "Weighing sampled rows in stream '${stream.label}' by at least $weight." }
+        return weight
+    }
+
+    companion object {
+        /** Sampling rates for [largeSampleWeight], as powers of 2, from densest to sparsest. */
+        private val SPARSER_SAMPLE_RATES_INV_POW2: List<Int> = listOf(20, 24, 28)
+    }
 }
 
 /** Sequential JDBC implementation of [PartitionsCreator]. */
@@ -249,6 +282,39 @@ open class JdbcConcurrentPartitionsCreator<
         }
         // Happy path.
         log.info { "Target partition size is ${sharedState.targetPartitionByteSize shr 20} MiB." }
+        val splitBoundaries: List<OpaqueStateValue> =
+            if (sharedState.withLargeTableSplits) {
+                val largeTableByteSize: Long =
+                    if (sample.kind == Sample.Kind.LARGE) {
+                        val weight: Long = largeSampleWeight(sample.valueWeight)
+                        (rowByteSizeSample.sampledValues.sum() * weight).also {
+                            log.info { "Table memory size re-estimated at ${it shr 20} MiB." }
+                        }
+                    } else {
+                        expectedTableByteSize
+                    }
+                evenlySpacedSplitBoundaries(sample, largeTableByteSize)
+            } else {
+                randomSplitBoundaries(sample, expectedTableByteSize)
+            }
+
+        // Handle edge case with empty split boundaries when sampling rate is too low,
+        // causing random filtering to discard all sampled boundaries, which would
+        // lead to division by zero the in the split() function. Fall back to single partition.
+        if (splitBoundaries.isEmpty()) {
+            log.warn { "No split boundaries found, using single partition" }
+            return listOf(JdbcNonResumablePartitionReader(partition))
+        }
+        val partitions: List<JdbcPartition<*>> = partitionFactory.split(partition, splitBoundaries)
+        log.info { "Table will be read by ${partitions.size} concurrent partition reader(s)." }
+        return partitions.map { JdbcNonResumablePartitionReader(it) }
+    }
+
+    /** Keeps each sampled row as a split boundary with the expected boundary rate. */
+    private fun randomSplitBoundaries(
+        sample: Sample<Pair<OpaqueStateValue?, Long>>,
+        expectedTableByteSize: Long,
+    ): List<OpaqueStateValue> {
         val secondarySamplingRate: Double =
             if (expectedTableByteSize <= sharedState.targetPartitionByteSize) {
                 0.0
@@ -262,21 +328,38 @@ open class JdbcConcurrentPartitionsCreator<
                 }
             }
         val random = Random(expectedTableByteSize) // RNG output is repeatable.
-        val splitBoundaries: List<OpaqueStateValue> =
-            sample.sampledValues
-                .filter { random.nextDouble() < secondarySamplingRate }
-                .mapNotNull { (splitBoundary: OpaqueStateValue?, _) -> splitBoundary }
-                .distinct()
+        return sample.sampledValues
+            .filter { random.nextDouble() < secondarySamplingRate }
+            .mapNotNull { (splitBoundary: OpaqueStateValue?, _) -> splitBoundary }
+            .distinct()
+    }
 
-        // Handle edge case with empty split boundaries when sampling rate is too low,
-        // causing random filtering to discard all sampled boundaries, which would
-        // lead to division by zero the in the split() function. Fall back to single partition.
-        if (splitBoundaries.isEmpty()) {
-            log.warn { "No split boundaries found, using single partition" }
-            return listOf(JdbcNonResumablePartitionReader(partition))
-        }
-        val partitions: List<JdbcPartition<*>> = partitionFactory.split(partition, splitBoundaries)
-        log.info { "Table will be read by ${partitions.size} concurrent partition reader(s)." }
-        return partitions.map { JdbcNonResumablePartitionReader(it) }
+    /**
+     * Splits the table into partitions of about [JdbcSharedState.targetPartitionByteSize] at evenly
+     * spaced sampled rows, so that a table larger than one partition gets at least one boundary.
+     */
+    private fun evenlySpacedSplitBoundaries(
+        sample: Sample<Pair<OpaqueStateValue?, Long>>,
+        expectedTableByteSize: Long,
+    ): List<OpaqueStateValue> {
+        val sortedBoundaries: List<OpaqueStateValue> =
+            sample.sampledValues.mapNotNull { (splitBoundary: OpaqueStateValue?, _) ->
+                splitBoundary
+            }
+        val targetPartitionByteSize: Long = sharedState.targetPartitionByteSize.coerceAtLeast(1L)
+        val partitionCount: Int =
+            ((expectedTableByteSize + targetPartitionByteSize - 1) / targetPartitionByteSize)
+                .coerceIn(1L, sortedBoundaries.size + 1L)
+                .toInt()
+        return evenlySpaced(sortedBoundaries, partitionCount - 1).distinct()
+    }
+
+    companion object {
+        /**
+         * Picks [count] values at evenly spaced positions in [sorted], which split the range that
+         * [sorted] was sampled from into [count] + 1 parts with about the same number of rows.
+         */
+        internal fun <T> evenlySpaced(sorted: List<T>, count: Int): List<T> =
+            (1..count).map { i -> sorted[i * sorted.size / (count + 1)] }
     }
 }

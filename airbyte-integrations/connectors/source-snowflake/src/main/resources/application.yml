@@ -12,6 +12,7 @@ airbyte:
       jdbc:
         mode: concurrent
         with-sampling: true
+        with-large-table-splits: true
         table-sample-size: 1024
         throughput-bytes-per-second: 10000000
         min-fetch-size: 10

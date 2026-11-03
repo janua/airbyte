@@ -29,6 +29,10 @@ interface JdbcSharedState {
     /** Sample size limit. */
     val maxSampleSize: Int
 
+    /** Should large tables be sized from sparser samples and split at evenly spaced boundaries? */
+    val withLargeTableSplits: Boolean
+        get() = false
+
     /** Targeted memory footprint of a partition, in bytes. */
     val targetPartitionByteSize: Long
 
