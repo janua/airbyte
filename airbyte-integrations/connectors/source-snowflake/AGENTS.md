@@ -50,6 +50,12 @@ The metadata querier recognizes object-level errors `2003`, `2043`, `2037`, and 
 
 **Why this matters:** A shifted bound can make a warm incremental sync skip rows. Preserve explicit `TIMESTAMP_NTZ` binding when changing cursor accessors.
 
+## 9. Large tables are split from sparser samples
+
+`application.yml` sets `with-large-table-splits: true`. When the 1 / 2^16 sample is full, the CDK samples at sparser rates to size the table, then splits it at evenly spaced sampled rows. Without this, every table over ~67M rows is estimated at the same size and can be read in one query.
+
+**Why this matters:** Snowflake's download links for a query's result chunks expire 6 hours after the query runs. A query whose results take longer than that to transfer fails with `Max retry reached for the download of chunk`, and every retry fails the same way. Keep each partition small enough to transfer within 6 hours.
+
 ## Reproducing bugs and testing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md#reproducing-bugs) for the remote-backend harness and troubleshooting details, and the

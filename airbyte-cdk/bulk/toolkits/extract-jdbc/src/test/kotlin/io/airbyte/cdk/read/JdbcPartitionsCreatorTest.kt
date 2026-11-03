@@ -232,6 +232,7 @@ class JdbcPartitionsCreatorTest {
     private fun concurrentSnapshotOfLargeTable(
         expectedThroughputBytesPerSecond: Long,
         vararg sparserSamplingQueries: TestFixtures.MockedQuery,
+        withLargeTableSplits: Boolean = true,
     ): List<DefaultJdbcSplittableSnapshotPartition> {
         val stream = stream(withCursor = false)
         val sharedState =
@@ -240,6 +241,7 @@ class JdbcPartitionsCreatorTest {
                     DefaultJdbcConstants(
                         withSampling = true,
                         maxSampleSize = 4,
+                        withLargeTableSplits = withLargeTableSplits,
                         expectedThroughputBytesPerSecond = expectedThroughputBytesPerSecond,
                     ),
                 mockedQueries = arrayOf(samplingQuery(16, *fullSample), *sparserSamplingQueries),
@@ -263,6 +265,21 @@ class JdbcPartitionsCreatorTest {
                 samplingQuery(24, idDateString(10000, "2024-08-01", "foo")),
             )
         Assertions.assertEquals(5, partitions.size)
+    }
+
+    @Test
+    fun testConcurrentSnapshotOfLargeTableWithoutLargeTableSplits() {
+        // The sampled rows keep their 2^16 weight, so the table is estimated to fit in one
+        // partition. The mocked querier fails on any sparser sampling query.
+        val partitions =
+            concurrentSnapshotOfLargeTable(
+                DefaultJdbcConstants.THROUGHPUT_BYTES_PER_SECOND,
+                withLargeTableSplits = false,
+            )
+        Assertions.assertEquals(
+            listOf<Pair<List<*>?, List<*>?>>(null to null),
+            partitions.map { it.lowerBound to it.upperBound },
+        )
     }
 
     @Test
@@ -445,7 +462,12 @@ class JdbcPartitionsCreatorTest {
         val stream = stream(withCursor = false)
         val sharedState =
             sharedState(
-                constants = DefaultJdbcConstants(withSampling = true, maxSampleSize = 4),
+                constants =
+                    DefaultJdbcConstants(
+                        withSampling = true,
+                        maxSampleSize = 4,
+                        withLargeTableSplits = true,
+                    ),
                 mockedQueries = arrayOf(samplingQuery(16, *fullSample)),
             )
         val factory = sharedState.factory()
